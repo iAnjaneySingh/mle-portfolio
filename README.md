@@ -15,11 +15,6 @@ skew becomes a 409 instead of a silent accuracy regression. Lookahead bias
 becomes a failing test instead of an inflated Sharpe. Streaming/batch divergence
 becomes a non-zero exit code instead of a model that degrades in month three.
 
-## Suggested resume framing
-
-Bullets that lead with the engineering decision rather than the tool list —
-tools go in the skills section, judgment goes in the bullets:
-
 **Model serving platform**
 - Built a feature store whose version is a hash of its transform source code, so
   a changed feature lands in a new keyspace and the inference service rejects
@@ -50,12 +45,6 @@ tools go in the skills section, judgment goes in the bullets:
   microsecond/nanosecond resolution bug that silently inflated every window 1000x.
 - Achieved effectively-once delivery into Redis via version-keyed idempotent
   writes guarded by a stored window watermark, without distributed transactions.
-
-## Interview prep
-
-Each README has a "known limits" section. Those are the questions a good
-interviewer will ask, answered before they ask — which is usually a better
-signal than the project itself.
 
 All three run locally with `docker compose up` and `make test`. Every test suite
 passes; the two failing-by-design scenarios in repo 3 are assertions that the
