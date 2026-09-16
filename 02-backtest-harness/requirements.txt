@@ -1,0 +1,7 @@
+pandas==2.2.3
+numpy==2.2.1
+scipy==1.15.0
+pyarrow==18.1.0
+matplotlib==3.10.0
+mlflow==2.19.0
+pytest==8.3.4

@@ -1,0 +1,9 @@
+pyspark==3.5.4
+delta-spark==3.3.0
+kafka-python==2.0.2
+redis==5.2.1
+pandas==2.2.3
+numpy==2.2.1
+pyarrow==18.1.0
+scikit-learn==1.6.0
+pytest==8.3.4
