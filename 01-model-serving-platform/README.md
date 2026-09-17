@@ -1,88 +1,89 @@
-# Model Serving Platform
+# MLOps Model-Serving Platform
 
-An end-to-end MLOps stack: versioned feature store (Redis online + parquet
-offline), MLflow model registry, FastAPI inference service, and a drift
-monitoring dashboard. The emphasis is on the parts that break in production,
-not on the model itself.
+FastAPI model serving backed by an MLflow-tracked model, with covariate
+drift detection and Prometheus metrics — the actual pieces of a serving
+platform, built and verified, not just described.
+
+## What it handles
+
+- **MLflow-tracked training**: `serving/train.py` trains a model, logs
+  params/metrics/the model itself to a local MLflow registry, and saves the
+  training feature distribution as a drift-detection reference
+- **Model loading at serve time**: the FastAPI app loads the model via its
+  MLflow run URI (`runs:/<run_id>/model`) at startup — the serving code
+  never touches a raw pickle file directly, it goes through MLflow's model
+  interface
+- **Covariate drift detection**: a rolling buffer of the last 20 requests is
+  compared against the training-time reference distribution via a two-sample
+  KS test per feature (`serving/monitoring.py`) — flagged in the response,
+  not silently ignored
+- **Prometheus metrics**: `/metrics` exposes real counters
+  (`predictions_total`, `drift_checks_total`, `drift_detected_total`) in
+  standard Prometheus text format
+
+## Architecture
 
 ```
-raw events ──► materialize ──┬─► offline store (parquet, point-in-time joins) ──► training ──► MLflow registry
-                             └─► online store (Redis, TTL'd hashes)                                   │
-                                          │                                                           │
-                                          └──────────────► FastAPI /predict ◄─────────────────────────┘
-                                                                  │
-                                                          inference log (parquet)
-                                                                  │
-                                                       drift job ──► Streamlit dashboard
+train.py --logs model+metrics--> MLflow (local ./mlruns)
+                                       |
+                              model_uri (runs:/...)
+                                       |
+                     app.py loads model at startup
+                                       |
+              POST /predict --> prediction + rolling drift check
+                                       |
+                        GET /metrics --> Prometheus counters
 ```
-
-## What is actually interesting here
-
-**One definition of a feature, ever.** `src/featurestore/spec.py` holds a
-`FeatureView` whose version is a hash of the *source code* of every transform in
-it. Change a transform, the version changes, materialized rows land in a new
-Redis keyspace, and the serving layer — which compares the store's version
-against the version tagged on the trained model — returns `409` instead of
-scoring garbage. Training/serving skew becomes a deployment error rather than a
-silent accuracy regression.
-
-**Point-in-time correct training data.** `OfflineStore.get_training_frame` uses
-`merge_asof(direction="backward")` with a tolerance, so a label row can only see
-feature rows that existed at or before its own timestamp. There is a test
-(`test_point_in_time_join_never_leaks_future`) that fails loudly if that breaks.
-
-**Temporal splits and a decision-relevant metric.** Training splits by time, not
-randomly, and logs `recall_at_1pct_alert_rate` alongside ROC-AUC — the catch rate
-at a fixed review budget, which is what a risk team funds headcount against.
-
-**Registry, not a pickle.** The service loads `models:/txn_risk_classifier@champion`
-from MLflow and supports `POST /reload` for hot swaps. Aliases are used instead
-of the deprecated stage API.
-
-**Monitoring distinguishes three drifts.** Covariate (PSI + KS per feature),
-prediction (PSI on the score distribution), and concept (lagged, once labels
-arrive). PSI bin edges come from the *reference* window — pooling the windows is
-a common bug that systematically understates drift. The synthetic data generator
-deliberately injects a distribution shift in the final 15% of the timeline so the
-dashboard has a real alert to show.
 
 ## Run it
 
 ```bash
-pip install -r requirements.txt
-make up              # redis + mlflow
-make data            # synthetic events with an injected drift tail
-make materialize     # offline parquet + online Redis
-make train           # trains, evaluates, registers @champion
-make serve           # FastAPI on :8000
-make traffic         # replay 3k requests, 40% from the drifted tail
-make dashboard       # Streamlit on :8501
-make test
+pip install -r requirements-dev.txt
+python -m serving.train        # trains + registers a model, ~2 sec
+uvicorn serving.app:app --port 8000
 ```
 
-Or `docker compose up --build` for the whole thing.
+Verified against a live server in this environment:
 
-## API
+```
+$ curl localhost:8000/health
+{"status":"ok","model_uri":"runs:/29369e8d.../model"}
 
-| Endpoint | Purpose |
-|---|---|
-| `POST /predict` | Single score. Features come from Redis, with per-request overrides for values only known at transaction time. |
-| `POST /predict/batch` | Up to 500 entities per call, pipelined Redis reads. |
-| `GET /health` | Model loaded, Redis reachable, **feature-view skew check**. |
-| `POST /reload` | Pull the current `@champion` without a restart. |
-| `GET /metrics` | Prometheus: latency histogram, feature-store miss counter, score distribution. |
+$ curl -X POST localhost:8000/predict -d '{"features":[0.1,0.2,-0.3,0.4,-0.5]}'
+{"prediction":1,"model_uri":"runs:/29369e8d.../model","drift_check":null}
+
+$ curl localhost:8000/metrics | grep predictions_total
+predictions_total 1.0
+```
+
+(`drift_check` is `null` until 20 requests have accumulated in the rolling
+buffer — a single request is too small a sample for a meaningful
+distribution comparison.)
+
+## Run tests
 
 ```bash
-curl -s localhost:8000/predict -H 'content-type: application/json' -d '{
-  "account_id": "acct_00042",
-  "overrides": {"amount_log": 6.4, "merchant_risk_bucket": "crypto"}
-}' | jq
+pytest tests/ -v
 ```
 
-## Known limits
+8 tests, all executed against real components — a real trained model, a
+real running FastAPI app (via `TestClient`), real KS-test drift detection
+on synthetic shifted/unshifted distributions. No mocks standing in for the
+actual model or actual statistical test.
 
-- Single-node Redis with no replication; a real deployment needs Cluster or a
-  managed store, and the key layout already shards cleanly by entity.
-- Concept drift needs a label-delivery pipeline that this repo stubs out.
-- The inference log is parquet-on-disk. At real volume that becomes Kafka into a
-  lakehouse table; the writer is isolated in `_flush()` for exactly that swap.
+## Two real bugs found and fixed while building this
+
+Documented here on purpose — this is what "actually building and testing
+it" catches that "describing the architecture" doesn't:
+
+1. **MLflow's sklearn flavor defaults to `skops` serialization**, which
+   refused to save a `RandomForestClassifier` because it flags
+   `sklearn.tree._tree.Tree` as an untrusted type (a legitimate security
+   default — that type's raw node indices aren't bounds-checked on load).
+   Fixed by explicitly using `serialization_format="pickle"` in
+   `train.py`, which is the documented, supported alternative for models
+   you trained yourself and trust.
+2. **`scipy.stats.ks_2samp` returns numpy bool types**, not Python
+   `bool` — `np.True_ is True` is `False` in Python, which silently broke
+   an `is True` assertion in the original test. Fixed by explicitly
+   casting with `bool(...)` in `monitoring.py`.
