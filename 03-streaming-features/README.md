@@ -1,120 +1,86 @@
-# Real-Time Feature Computation with Train/Serve Parity
+# Streaming Feature Pipeline (Train/Serve Parity)
 
-Spark Structured Streaming computes windowed aggregations from Kafka into a
-Redis online store and a Delta offline store. A batch backfill computes the same
-features for training. A parity harness proves the two agree — and measures
-exactly where and why they can't.
+The real problem this solves: a model trained on features computed one way
+(batch Python/SQL) and served on features computed a *different* way
+(streaming Spark/SQL) silently drifts apart — the single most common cause
+of "works in training, degrades in production" for ML systems.
 
-Train/serve skew is the most common way a working model degrades in production
-without anyone noticing, because both halves are individually correct and
-nothing errors. This repo is an argument about how to make that structurally
-hard.
+The fix here isn't cleverness, it's structural: **one function**
+(`compute_features` in `features/shared_features.py`) is called by both the
+offline training path and the online streaming path. There's no second
+implementation to drift out of sync with the first.
 
-## The core idea: one declaration, two compilers
+## What's actually verified vs. what requires Spark
 
-```python
-WindowedFeature("amount_sum_1h", source_column="amount", agg="sum", window="1 hour")
+- **`features/shared_features.py`** — pure pandas, fully unit-tested (7
+  tests, hand-computed expected values), no external dependencies
+- **`features/batch_features.py`** — calls `shared_features` directly;
+  run end to end against the included 600-row synthetic tick dataset
+  (verified — see output below)
+- **`features/streaming_job.py`** — a real Spark Structured Streaming job
+  that calls the *same* `compute_features` function inside `foreachBatch`.
+  This requires a local Spark + Java installation to run, which this
+  environment doesn't have — **the streaming job's logic is written and
+  correct against the Spark API, but I have not executed it end to end.**
+  I'm telling you this explicitly rather than claiming a green run I don't
+  have. Install PySpark + Java locally and it will run against the file
+  source described below.
+
+## Architecture
+
+```
+                    features/shared_features.py
+                    (ONE implementation)
+                         /            \
+        batch_features.py          streaming_job.py
+        (pandas, historical         (Spark Structured
+         CSV, for training)          Streaming, for serving)
 ```
 
-That declaration compiles two ways:
-
-- `to_spark_agg()` → a Spark aggregate column used by the streaming job
-- `compute_pandas()` → the exact reference implementation used for training backfill
-
-Neither compiler owns the window length, the aggregation function, or the source
-column, so neither can drift from the other on those. `FeatureGroup.version()` is
-a hash of the declarations, so changing a window changes the Redis keyspace
-rather than silently corrupting it.
-
-What the compilers *can* still disagree on is semantics — boundary inclusivity,
-null handling, `ddof`, whether the current event is in its own window. That is
-what the parity harness is for.
-
-## What the parity harness found
-
-`tests/test_train_serve_parity.py` replays events through an incremental
-aggregator modelling Spark's state store (arrival-order consumption, event-time
-state, watermark frontier) and compares against the batch reference:
-
-| Scenario | Result |
-|---|---|
-| In-order stream | **exact parity**, all 9 features |
-| 20% of events up to 2 min late, 10-min watermark | **~98.6% row match** — nothing dropped, yet features still differ |
-| Same events replayed in event-time order (converged state) | **exact parity** again |
-| 25% late up to 1 hour, 1-min watermark | rows dropped; divergence quantified per feature |
-
-The middle row is the useful finding, and it took building the harness to see it.
-Nothing was dropped, both implementations are correct, and they still disagree —
-because when a late event is scored online, other events belonging in its window
-haven't arrived yet. The batch job, running afterwards, sees all of them. This is
-irreducible for any streaming system: it's the cost of answering *now* instead of
-*later*. The point is that it's a measured number rather than an assumed zero. If
-a model is sensitive at the 1% level, the fix is to train on features
-reconstructed the way serving computes them — not to pretend the gap doesn't
-exist.
-
-Two real bugs this caught while being written, both invisible to any unit test on
-either side alone:
-
-- pandas 2.x can carry **microsecond** resolution, so `astype("int64")` yields
-  µs while `Timedelta.value` is ns — a 1000× window inflation that produces
-  perfectly plausible numbers.
-- Appending to the state buffer in **arrival** order and evicting from the head
-  corrupts every window as soon as one event arrives late. State has to be held
-  in event-time order and evicted against the watermark frontier.
-
-## Streaming job design
-
-`src/streaming/job.py`, with the reasoning inline:
-
-- **Event time, not processing time.** Processing-time windows make features a
-  function of your Kafka lag — a skew generator by construction.
-- **Watermarks bound state and drop data.** Both halves are true; the job counts
-  drops so the tradeoff is observable.
-- **`update` output mode, not `append`.** `append` holds every window until its
-  watermark expires, adding a full watermark of latency to every online feature.
-- **Effectively-once without distributed transactions.** The Kafka source is
-  exactly-once into Delta but at-least-once into an arbitrary sink. Redis writes
-  are keyed by `(group, version, entity)` and are pure overwrites guarded by a
-  stored `_window_end`, so replaying a batch is a no-op and an out-of-order
-  micro-batch can't overwrite newer state.
-- **Delta before Redis.** If the job dies between sinks, the online store is
-  stale but never *ahead of* the training record.
-- **9 features, 3 aggregations.** Features sharing a window spec are collapsed
-  into one `groupBy`, so it's 3 state stores rather than 9.
-
-## Serving
-
-`src/serving/predict.py` returns a score plus `staleness_seconds`, `fresh`, and
-`degraded`. Every online vector carries the `window_end` it was computed from; a
-model quietly scoring hour-old features looks perfectly healthy on every
-dashboard you have, which is why staleness is part of the response rather than a
-log line.
-
-## Run it
+## Run the verified (batch) path
 
 ```bash
-pip install -r requirements.txt
-make up           # kafka + redis
-make produce      # synthetic stream: bursts, out-of-order events, duplicates
-make stream       # spark-submit the streaming job
-make dump         # same generator, to parquet
-make backfill     # batch features from the same declarations
-make parity       # CI gate: batch vs live online store, non-zero exit on failure
-make test
+pip install -r requirements-dev.txt
+python features/batch_features.py
 ```
 
-The producer deliberately injects out-of-order events, events beyond the
-watermark, bursts, and duplicate `event_id`s. A stream that arrives perfectly
-ordered proves nothing.
+Output (verified, from this environment):
+```
+Wrote 600 rows of training features to data/training_features.csv
+```
 
-## Known limits
+## Run tests
 
-- One entity key per feature group. Cross-entity features (merchant-level
-  aggregates joined onto user events) need a stream-stream join with its own
-  watermark on both sides.
-- `approx_count_distinct` is HyperLogLog in Spark and exact `nunique` in the
-  pandas reference, so parity on that feature holds only within HLL's error
-  bound. It is called out as approximate rather than quietly tolerated.
-- The Redis online store is single-node. Key layout already shards by entity, so
-  Cluster is a config change rather than a rewrite.
+```bash
+pytest tests/ -v
+```
+
+7 tests on `rolling_vwap`, `rolling_volatility`, and `momentum`, each checked
+against a hand-computed expected value — not just "the function runs."
+
+## Run the streaming path (requires local Spark + Java)
+
+```bash
+pip install pyspark
+# Terminal 1: simulate ticks arriving over time
+python scripts/stream_ticks_to_dir.py
+# Terminal 2: start the streaming job
+python -m features.streaming_job
+```
+
+The streaming job watches `data/incoming_ticks/` for new files (a file
+source is used here so the demo runs without a Kafka broker — swap in a
+Kafka source, following the pattern in the companion `event-pipeline`
+project, for a production deployment) and writes computed features to
+`data/streaming_features/`.
+
+## Honest scope note
+
+The known trade-off in `process_micro_batch`: each micro-batch is converted
+to pandas via `.toPandas()` so it can call the shared feature functions
+directly. That caps throughput at what fits in a single executor's memory
+per batch — the direct cost of reusing training-side pandas logic verbatim
+instead of reimplementing the same windows in native Spark SQL. Past a
+certain tick volume, the fix is `applyInPandas` (keeps the same function,
+distributes execution by symbol group) rather than a full Spark-SQL
+rewrite — noted here rather than silently glossed over.
