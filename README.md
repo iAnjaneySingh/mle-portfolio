@@ -41,7 +41,6 @@ Built around one non-negotiable rule: a strategy's position on day t is only exp
 
 Design
 
-<<<<<<< HEAD
 A FastAPI service that loads a trained model through MLflow's model
 interface and flags covariate drift on live traffic instead of leaving that
 to a dashboard nobody's watching.
