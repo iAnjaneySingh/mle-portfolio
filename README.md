@@ -1,6 +1,5 @@
 MLE Portfolio
 
-<<<<<<< HEAD
 Three systems built around ML/trading failure modes that don't announce
 themselves — a model silently served on stale features, a backtest that
 looks profitable because of lookahead, feature logic that quietly diverges
@@ -36,7 +35,7 @@ python -m serving.train
 uvicorn serving.app:app --port 8000
 pytest tests/ -v
 02 — Backtest Harness
->>>>>>> fd9be1af44236f8806fa8ab8b0f710bb27e79f92
+ fd9be1af44236f8806fa8ab8b0f710bb27e79f92
 
 Built around one non-negotiable rule: a strategy's position on day t is only exposed to day t+1's return. The engine enforces this — it isn't left to the strategy implementation to get right.
 
